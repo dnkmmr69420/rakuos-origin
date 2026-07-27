@@ -1,0 +1,256 @@
+#!/usr/bin/bash
+# raku-origin — detect origin of commands or files on RakuOS
+# (files only — directories are rejected)
+#
+# Usage:
+#   raku-origin <command>              # like which + origin
+#   raku-origin -f|--file <path>       # check a file’s origin
+#   raku-origin -p|--package <name>    # check package: user / base / not-installed
+#   raku-origin -a|--all <name>        # try command → file → package
+
+set -euo pipefail
+
+UPPER_DIR="/var/lib/rakuos/overlay/upper"
+PACKAGES_LIST="/var/lib/rakuos/packages.list"
+
+# Colors (only if stdout is a terminal)
+if [[ -t 1 ]]; then
+    C_USER='\033[1;32m'   # green
+    C_BASE='\033[1;34m'   # blue
+    C_NONE='\033[1;31m'   # red
+    C_RESET='\033[0m'
+    C_BOLD='\033[1m'
+else
+    C_USER= C_BASE= C_NONE= C_RESET= C_BOLD=
+fi
+
+die() { echo "error: $*" >&2; exit 1; }
+usage() {
+    cat <<EOF
+Usage: raku-origin [options] <target>
+
+  raku-origin <command>              Report path + whether user-installed or base
+  raku-origin -f|--file <path>       Check if a *file* is from overlay or base
+  raku-origin -p|--package <name>    Check package origin:
+                                       • user-installed  (in packages.list)
+                                       • base system     (installed, not in list)
+                                       • not installed   (absent from system)
+  raku-origin -a|--all <name>        Try command, then file, then package
+
+Options:
+  -h, --help     Show this help
+  -q, --quiet    Only print origin (user / base / not-found / not-installed)
+  -v, --verbose  Extra details
+
+Notes:
+  • Only regular files (and symlinks to files) are accepted.
+  • Directories are always rejected.
+  • Package check uses rpm + packages.list to distinguish the three states.
+
+Examples:
+  raku-origin htop
+  raku-origin -f /usr/bin/htop
+  raku-origin -p neovim
+  raku-origin -a ffmpeg
+EOF
+}
+
+# Return 0 if the path is a regular file or a symlink that ultimately points to a file
+is_file() {
+    local p="$1"
+    [[ -f "$p" ]] || [[ -L "$p" && -f "$(realpath -e "$p" 2>/dev/null || true)" ]]
+}
+
+# Resolve whether a *file* under /usr comes from the overlay
+is_from_overlay() {
+    local target="$1"
+    if [[ "$target" != /usr/* ]]; then
+        return 1
+    fi
+    local rel="${target#/usr/}"
+    local upper_path="${UPPER_DIR}/${rel}"
+    [[ -f "$upper_path" || -L "$upper_path" ]]
+}
+
+# Pretty-print origin for a resolved *file* path
+report_path() {
+    local path="$1"
+    local quiet="${2:-0}"
+    local verbose="${3:-0}"
+
+    # does not exist anywhere
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+        if [[ $quiet -eq 1 ]]; then
+            echo "not-found"
+        else
+            echo -e "${C_NONE}does not exist${C_RESET}: $path"
+        fi
+        return 1
+    fi
+
+    # reject directories
+    if [[ -d "$path" && ! -L "$path" ]]; then
+        if [[ $quiet -eq 1 ]]; then
+            echo "directory"
+        else
+            echo -e "${C_NONE}directories are not supported${C_RESET}: $path"
+            echo "  (only regular files / symlinks to files are checked)"
+        fi
+        return 1
+    fi
+
+    # must be a file
+    if ! is_file "$path"; then
+        if [[ $quiet -eq 1 ]]; then
+            echo "not-a-file"
+        else
+            echo -e "${C_NONE}not a regular file${C_RESET}: $path"
+        fi
+        return 1
+    fi
+
+    local real
+    real=$(realpath -e "$path" 2>/dev/null || readlink -f "$path" 2>/dev/null || echo "$path")
+
+    if is_from_overlay "$real"; then
+        if [[ $quiet -eq 1 ]]; then
+            echo "user"
+        else
+            echo -e "${C_USER}user-installed${C_RESET}  $real"
+            if [[ $verbose -eq 1 ]]; then
+                local rel="${real#/usr/}"
+                echo "  overlay: ${UPPER_DIR}/${rel}"
+            fi
+        fi
+    else
+        if [[ $quiet -eq 1 ]]; then
+            echo "base"
+        else
+            echo -e "${C_BASE}base system${C_RESET}     $real"
+            if [[ $verbose -eq 1 && "$real" == /usr/* ]]; then
+                echo "  (not present in ${UPPER_DIR})"
+            fi
+        fi
+    fi
+}
+
+# Command mode (like which)
+do_command() {
+    local cmd="$1"
+    local quiet="$2"
+    local verbose="$3"
+
+    local path
+    path=$(type -P "$cmd" 2>/dev/null) || {
+        if [[ $quiet -eq 1 ]]; then
+            echo "not-found"
+        else
+            echo -e "${C_NONE}command does not exist${C_RESET}: $cmd"
+        fi
+        return 1
+    }
+
+    report_path "$path" "$quiet" "$verbose"
+}
+
+# File mode
+do_file() {
+    local target="$1"
+    local quiet="$2"
+    local verbose="$3"
+
+    if [[ "$target" == ~* ]]; then
+        target="${target/#\~/$HOME}"
+    fi
+    if [[ "$target" != /* ]]; then
+        target="$(pwd)/$target"
+    fi
+
+    report_path "$target" "$quiet" "$verbose"
+}
+
+# Package mode — three-way detection
+do_package() {
+    local pkg="$1"
+    local quiet="$2"
+    local verbose="$3"
+
+    # 1. Is the package installed at all? (rpm is the source of truth)
+    if ! rpm -q --quiet "$pkg" 2>/dev/null; then
+        if [[ $quiet -eq 1 ]]; then
+            echo "not-installed"
+        else
+            echo -e "${C_NONE}not installed${C_RESET}: $pkg"
+        fi
+        return 1
+    fi
+
+    # 2. It is installed — now check whether it is tracked as a user/overlay package
+    local in_overlay=0
+    if [[ -f "$PACKAGES_LIST" ]] && grep -qxF "$pkg" "$PACKAGES_LIST" 2>/dev/null; then
+        in_overlay=1
+    fi
+
+    if [[ $in_overlay -eq 1 ]]; then
+        if [[ $quiet -eq 1 ]]; then
+            echo "user"
+        else
+            echo -e "${C_USER}user-installed package${C_RESET}: $pkg"
+            if [[ $verbose -eq 1 ]]; then
+                echo "  listed in $PACKAGES_LIST"
+                rpm -q "$pkg" 2>/dev/null | sed 's/^/  rpm: /'
+            fi
+        fi
+    else
+        if [[ $quiet -eq 1 ]]; then
+            echo "base"
+        else
+            echo -e "${C_BASE}base system package${C_RESET}: $pkg"
+            if [[ $verbose -eq 1 ]]; then
+                echo "  installed, but not present in $PACKAGES_LIST"
+                rpm -q "$pkg" 2>/dev/null | sed 's/^/  rpm: /'
+            fi
+        fi
+    fi
+}
+
+# ---------- main ----------
+MODE="command"
+QUIET=0
+VERBOSE=0
+TARGET=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        -f|--file) MODE="file"; shift ;;
+        -p|--package) MODE="package"; shift ;;
+        -a|--all) MODE="all"; shift ;;
+        -q|--quiet) QUIET=1; shift ;;
+        -v|--verbose) VERBOSE=1; shift ;;
+        --) shift; break ;;
+        -*) die "unknown option: $1" ;;
+        *) TARGET="$1"; shift; break ;;
+    esac
+done
+
+[[ -z "$TARGET" && $# -gt 0 ]] && TARGET="$1"
+[[ -z "$TARGET" ]] && { usage; exit 1; }
+
+case "$MODE" in
+    command) do_command "$TARGET" "$QUIET" "$VERBOSE" ;;
+    file)    do_file    "$TARGET" "$QUIET" "$VERBOSE" ;;
+    package) do_package "$TARGET" "$QUIET" "$VERBOSE" ;;
+    all)
+        if type -P "$TARGET" &>/dev/null; then
+            echo -e "${C_BOLD}as command:${C_RESET}"
+            do_command "$TARGET" "$QUIET" "$VERBOSE"
+        fi
+        if [[ -e "$TARGET" || -L "$TARGET" || "$TARGET" == /* || "$TARGET" == ~* ]]; then
+            echo -e "${C_BOLD}as file:${C_RESET}"
+            do_file "$TARGET" "$QUIET" "$VERBOSE"
+        fi
+        echo -e "${C_BOLD}as package:${C_RESET}"
+        do_package "$TARGET" "$QUIET" "$VERBOSE"
+        ;;
+esac
