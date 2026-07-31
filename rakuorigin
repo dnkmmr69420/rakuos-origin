@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# rakuorigin — classify paths/commands/packages as base or user on Rakuos
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+OVERLAY_UPPER="/var/lib/rakuos/overlay/upper"
+BASE_TOML="/var/lib/rakuos/image-packages.toml"
+USR_ROOT="/usr"
+
+# ---------------------------------------------------------------------------
+# Globals set by flag parsing
+# ---------------------------------------------------------------------------
+OUTPUT_ONLY=false
+PACKAGE_MODE=false
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+Usage: rakuorigin [OPTIONS] <path|command|package>
+
+Classify whether a file, command or package belongs to the base image
+or was installed by the user (overlay).
+
+Options:
+  -o    Minimal output: only "base", "user", "subdirectory", "external" or "error"
+  -P    Treat the argument as a package name (with or without architecture suffix)
+
+Examples:
+  rakuorigin bash
+  rakuorigin /usr/bin/ls
+  rakuorigin -o /bin/echo
+  rakuorigin -P 7zip
+  rakuorigin -P 7zip.x86_64
+  rakuorigin /usr/share/applications
+EOF
+    exit 1
+}
+
+die() {
+    if $OUTPUT_ONLY; then
+        printf 'error\n'
+    else
+        printf 'error: %s\n' "$*" >&2
+    fi
+    exit 1
+}
+
+# Return 0 if $1 is under /usr but NOT under /usr/local
+is_allowed_usr_path() {
+    local resolved="$1"
+    case "$resolved" in
+        "$USR_ROOT"/local/*|"$USR_ROOT"/local)
+            return 1
+            ;;
+        "$USR_ROOT"/*|"$USR_ROOT")
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Given a resolved absolute path under /usr, return "user" or "base"
+classify_path() {
+    local abs="$1"
+    local rel="${abs#"$USR_ROOT"}"
+    # strip leading slash so we can join cleanly
+    rel="${rel#/}"
+
+    if [[ -e "${OVERLAY_UPPER}/${rel}" ]] || [[ -L "${OVERLAY_UPPER}/${rel}" ]]; then
+        printf 'user'
+    else
+        printf 'base'
+    fi
+}
+
+# Extract bare package names from packages.toml
+# Handles lines like: "7zip.x86_64" = {reason = "Dependency"}
+load_base_packages() {
+    if [[ ! -f "$BASE_TOML" ]]; then
+        die "base package list not found: $BASE_TOML"
+    fi
+    # Pull the quoted key, strip the quotes
+    grep -oE '"[^"]+"\s*=' "$BASE_TOML" 2>/dev/null \
+        | sed 's/^"//;s/"\s*=$//' \
+        | sort -u
+}
+
+# Normalize a package name: accept both "foo" and "foo.x86_64"
+# Returns the matching name as it appears in the base list / rpm, or empty
+normalize_pkg() {
+    local input="$1"
+    local base_list
+    base_list=$(load_base_packages)
+
+    # Exact match first
+    if printf '%s\n' "$base_list" | grep -qxF "$input"; then
+        printf '%s' "$input"
+        return
+    fi
+
+    # Try with common arches appended
+    local arch
+    for arch in x86_64 aarch64 noarch i686; do
+        if printf '%s\n' "$base_list" | grep -qxF "${input}.${arch}"; then
+            printf '%s' "${input}.${arch}"
+            return
+        fi
+    done
+
+    # Try stripping an existing arch suffix and re-matching
+    local bare="${input%.*}"
+    if [[ "$bare" != "$input" ]]; then
+        if printf '%s\n' "$base_list" | grep -qxF "$bare"; then
+            printf '%s' "$bare"
+            return
+        fi
+        for arch in x86_64 aarch64 noarch i686; do
+            if printf '%s\n' "$base_list" | grep -qxF "${bare}.${arch}"; then
+                printf '%s' "${bare}.${arch}"
+                return
+            fi
+        done
+    fi
+
+    # Fallback: see if rpm knows it (may be a pure user package)
+    if rpm -q "$input" &>/dev/null; then
+        printf '%s' "$input"
+        return
+    fi
+    if [[ "$bare" != "$input" ]] && rpm -q "$bare" &>/dev/null; then
+        printf '%s' "$bare"
+        return
+    fi
+
+    printf ''
+}
+
+# Classify a package name
+classify_package() {
+    local pkg="$1"
+    local normalized
+    normalized=$(normalize_pkg "$pkg")
+
+    if [[ -z "$normalized" ]]; then
+        die "package not found: $pkg"
+    fi
+
+    local base_list
+    base_list=$(load_base_packages)
+
+    if printf '%s\n' "$base_list" | grep -qxF "$normalized"; then
+        printf 'base'
+    else
+        # Present in rpm database but not in the image list → user
+        if rpm -q "$normalized" &>/dev/null; then
+            printf 'user'
+        else
+            die "package not installed: $normalized"
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+while getopts ':oP' opt; do
+    case "$opt" in
+        o) OUTPUT_ONLY=true ;;
+        P) PACKAGE_MODE=true ;;
+        *) usage ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+[[ $# -eq 1 ]] || usage
+TARGET="$1"
+
+# ---------------------------------------------------------------------------
+# Package mode (-P)
+# ---------------------------------------------------------------------------
+if $PACKAGE_MODE; then
+    result=$(classify_package "$TARGET")
+    if $OUTPUT_ONLY; then
+        printf '%s\n' "$result"
+    else
+        printf '%s: %s\n' "$TARGET" "$result"
+    fi
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Path / command mode
+# ---------------------------------------------------------------------------
+
+# 1. Resolve the target to an absolute path
+RESOLVED=""
+
+if [[ "$TARGET" == /* ]]; then
+    # Absolute path given
+    if [[ ! -e "$TARGET" && ! -L "$TARGET" ]]; then
+        die "path does not exist: $TARGET"
+    fi
+    RESOLVED=$(realpath -m "$TARGET" 2>/dev/null || readlink -f "$TARGET" 2>/dev/null || printf '%s' "$TARGET")
+else
+    # Treat as command name – look it up in PATH
+    if command -v "$TARGET" &>/dev/null; then
+        RESOLVED=$(command -v "$TARGET")
+        # Prefer the real binary, not a shell function/alias
+        RESOLVED=$(realpath -m "$RESOLVED" 2>/dev/null || readlink -f "$RESOLVED" 2>/dev/null || printf '%s' "$RESOLVED")
+    else
+        # Not in PATH at all
+        if $OUTPUT_ONLY; then
+            printf 'error\n'
+        else
+            printf 'error: command "%s" does not exist (not found in PATH)\n' "$TARGET" >&2
+        fi
+        exit 1
+    fi
+fi
+
+# 2. Enforce /usr restriction (allow /bin, /sbin etc. that resolve into /usr)
+if ! is_allowed_usr_path "$RESOLVED"; then
+    # Special case: found in PATH but outside /usr → "external"
+    if [[ "$TARGET" != /* ]] && command -v "$TARGET" &>/dev/null; then
+        if $OUTPUT_ONLY; then
+            printf 'external\n'
+        else
+            printf '%s → %s (not under /usr — external)\n' "$TARGET" "$RESOLVED"
+        fi
+        exit 0
+    fi
+    die "path is not under /usr (or is under /usr/local): $RESOLVED"
+fi
+
+# 3. Directory handling
+if [[ -d "$RESOLVED" ]]; then
+    # List every entry
+    # Use find to get a stable, sorted list; handle empty dirs gracefully
+    while IFS= read -r -d '' entry; do
+        # entry is absolute
+        if [[ -d "$entry" ]]; then
+            tag="subdirectory"
+        else
+            tag=$(classify_path "$entry")
+        fi
+
+        if $OUTPUT_ONLY; then
+            printf '%s\n' "$tag"
+        else
+            printf '%s  %s\n' "$entry" "$tag"
+        fi
+    done < <(find "$RESOLVED" -mindepth 1 -maxdepth 1 -print0 | sort -z)
+
+    exit 0
+fi
+
+# 4. Ordinary file / symlink
+tag=$(classify_path "$RESOLVED")
+
+if $OUTPUT_ONLY; then
+    printf '%s\n' "$tag"
+else
+    printf '%s → %s (%s)\n' "$TARGET" "$RESOLVED" "$tag"
+fi
