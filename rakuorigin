@@ -16,8 +16,9 @@ OUTPUT_ONLY=false
 PACKAGE_MODE=false
 EXIT_STATUS=0
 
-# Cached base package list (populated on first use)
-BASE_PKG_CACHE=""
+# Associative array of base packages (name.arch → 1). Populated once.
+declare -A BASE_PKGS=()
+BASE_PKGS_LOADED=false
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,7 +45,6 @@ EOF
 }
 
 # Print an error for the current item. Does NOT exit (so multiple args can be processed).
-# Sets EXIT_STATUS=1.
 report_error() {
     EXIT_STATUS=1
     if $OUTPUT_ONLY; then
@@ -83,96 +83,90 @@ classify_path() {
     fi
 }
 
-# Load (and cache) bare package names from image-packages.toml
-# Handles lines like: "7zip.x86_64" = {reason = "Dependency"}
+# Load image-packages.toml into the BASE_PKGS associative array (once).
 load_base_packages() {
-    if [[ -n "$BASE_PKG_CACHE" ]]; then
-        printf '%s' "$BASE_PKG_CACHE"
-        return
+    if $BASE_PKGS_LOADED; then
+        return 0
     fi
     if [[ ! -f "$BASE_TOML" ]]; then
         report_error "base package list not found: $BASE_TOML"
         return 1
     fi
-    BASE_PKG_CACHE=$(grep -oE '"[^"]+"\s*=' "$BASE_TOML" 2>/dev/null \
-        | sed 's/^"//;s/"\s*=$//' \
-        | sort -u)
-    printf '%s' "$BASE_PKG_CACHE"
+
+    local name
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        BASE_PKGS["$name"]=1
+    done < <(sed -n 's/^[[:space:]]*"\([^"]*\)".*=.*/\1/p' "$BASE_TOML")
+
+    BASE_PKGS_LOADED=true
+    return 0
 }
 
-# Normalize a package name: accept both "foo" and "foo.x86_64"
-# Prints the matching name or empty string. Exit status 0 always.
-normalize_pkg() {
+# Return 0 if the given name.arch (or bare name with common arches) is in the base list.
+is_base_package() {
     local input="$1"
-    local base_list
-    base_list=$(load_base_packages) || true
 
-    # Exact match first
-    if printf '%s\n' "$base_list" | grep -qxF "$input"; then
-        printf '%s' "$input"
-        return
+    # Exact match
+    if [[ -v BASE_PKGS["$input"] ]]; then
+        return 0
     fi
 
-    # Try with common arches appended
+    # Try appending common architectures
     local arch
     for arch in x86_64 aarch64 noarch i686; do
-        if printf '%s\n' "$base_list" | grep -qxF "${input}.${arch}"; then
-            printf '%s' "${input}.${arch}"
-            return
+        if [[ -v BASE_PKGS["${input}.${arch}"] ]]; then
+            return 0
         fi
     done
 
-    # Try stripping an existing arch suffix and re-matching
+    # If input already has an arch suffix, try the bare name + other arches
     local bare="${input%.*}"
     if [[ "$bare" != "$input" ]]; then
-        if printf '%s\n' "$base_list" | grep -qxF "$bare"; then
-            printf '%s' "$bare"
-            return
+        if [[ -v BASE_PKGS["$bare"] ]]; then
+            return 0
         fi
         for arch in x86_64 aarch64 noarch i686; do
-            if printf '%s\n' "$base_list" | grep -qxF "${bare}.${arch}"; then
-                printf '%s' "${bare}.${arch}"
-                return
+            if [[ -v BASE_PKGS["${bare}.${arch}"] ]]; then
+                return 0
             fi
         done
     fi
 
-    # Fallback: see if rpm knows it (may be a pure user package)
-    if rpm -q "$input" &>/dev/null; then
-        printf '%s' "$input"
-        return
-    fi
-    if [[ "$bare" != "$input" ]] && rpm -q "$bare" &>/dev/null; then
-        printf '%s' "$bare"
-        return
-    fi
-
-    printf ''
+    return 1
 }
 
-# Classify a package. Prints "base", "user", or nothing on failure.
-# Returns 0 on success, 1 on failure (caller should report_error).
+# Classify a package. Prints "base" or "user". Returns 0 on success, 1 if not found.
 classify_package() {
     local pkg="$1"
-    local normalized
-    normalized=$(normalize_pkg "$pkg")
 
-    if [[ -z "$normalized" ]]; then
-        return 1
-    fi
-
-    local base_list
-    base_list=$(load_base_packages) || true
-
-    if printf '%s\n' "$base_list" | grep -qxF "$normalized"; then
+    # First check whether it is a known base package (name or name.arch)
+    if is_base_package "$pkg"; then
         printf 'base'
         return 0
     fi
 
-    if rpm -q "$normalized" &>/dev/null; then
+    # Not in the image list — see if rpm knows it at all (user-installed)
+    # Try the name as-is and also the bare name without arch
+    if rpm -q "$pkg" &>/dev/null; then
         printf 'user'
         return 0
     fi
+
+    local bare="${pkg%.*}"
+    if [[ "$bare" != "$pkg" ]] && rpm -q "$bare" &>/dev/null; then
+        printf 'user'
+        return 0
+    fi
+
+    # Also try name.arch forms that rpm sometimes accepts
+    local arch
+    for arch in x86_64 aarch64 noarch i686; do
+        if rpm -q "${pkg}.${arch}" &>/dev/null; then
+            printf 'user'
+            return 0
+        fi
+    done
 
     return 1
 }
@@ -276,8 +270,12 @@ shift $((OPTIND - 1))
 [[ $# -ge 1 ]] || usage
 
 # ---------------------------------------------------------------------------
-# Main loop – process every remaining argument
+# Main
 # ---------------------------------------------------------------------------
+if $PACKAGE_MODE; then
+    load_base_packages || true
+fi
+
 for TARGET in "$@"; do
     if $PACKAGE_MODE; then
         process_package "$TARGET"
