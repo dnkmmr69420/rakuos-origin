@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# rorigin — Report the origin of a path under /usr on RakuOS
+#            (base system image vs user-installed overlay)
+#
+# Usage: rorigin [-b] [-u] [-s] [-p] <path>
+#
+#   -b   Show only base-system files
+#   -u   Show only user-installed (overlay) files
+#   -s   Silent/script mode:
+#          file   → "base" | "user" | "error"
+#          dir    → "directory" | "error"
+#        Always exits 0 in this mode (the token is the result),
+#        so it is safe to use with $(...) and set -e.
+#   -p   Plain names only: print paths without base/user/subdirectory/symlink labels
+#
+# Default (no -b/-u, or both) lists both categories.
+# When listing a directory, each entry is labelled:
+#   base | user | subdirectory | symlink
+# (unless -p is given, in which case only the path is printed)
+#
+# Only paths whose final destination is under /usr are accepted.
+# Symlinks that stay inside /usr are fine; symlinks that escape /usr
+# (e.g. /usr/local → /var/usrlocal) are rejected.
+# /bin, /sbin, /lib, /lib64 etc. work because they resolve into /usr.
+#
+# Exit codes:
+#   0  success (including silent-mode "error" token)
+#   1  usage error or (verbose mode only) path error
+
+set -uo pipefail
+# Note: -e is intentionally omitted so helper commands (realpath, etc.)
+# never abort the script before we can print a clean result token.
+
+OVERLAY_UPPER="/var/lib/rakuos/overlay/upper"
+
+show_base=false
+show_user=false
+silent=false
+plain=false
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [-b] [-u] [-s] [-p] <path>
+
+  -b   Only list base-system files
+  -u   Only list user-installed (overlay) files
+  -s   Silent mode: output only a single token
+         file      → base | user | error
+         directory → directory | error
+       Always exits 0 in this mode (the token is the result),
+       so it is safe to use with \$(...) and set -e.
+  -p   Plain names only: print paths without labels
+       (base / user / subdirectory / symlink)
+
+If neither -b nor -u is given (or both are given) both categories are shown.
+<path> must resolve under /usr.  Symlinks that escape /usr are rejected;
+symlinks that stay inside /usr are accepted.
+EOF
+    exit 1
+}
+
+# ------------------------------------------------------------------
+# Parse flags
+# ------------------------------------------------------------------
+while getopts ":busp" opt; do
+    case "$opt" in
+        b) show_base=true ;;
+        u) show_user=true ;;
+        s) silent=true ;;
+        p) plain=true ;;
+        *) usage ;;
+    esac
+done
+shift $((OPTIND - 1)) || true
+
+# Default behaviour: show both
+if ! $show_base && ! $show_user; then
+    show_base=true
+    show_user=true
+fi
+
+[[ $# -eq 1 ]] || usage
+TARGET="$1"
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+die() {
+    if $silent; then
+        # Silent mode is meant for scripting: always exit 0 so that
+        # status=$(rorigin -s ...) and set -e do not treat "error"
+        # as a shell failure.  The printed token is the result.
+        echo "error"
+        exit 0
+    else
+        echo "error: $*" >&2
+        exit 1
+    fi
+}
+
+# Print a result line.  With -p, only the path; otherwise "label\tpath".
+emit() {
+    local label="$1"
+    local path="$2"
+    if $plain; then
+        printf '%s\n' "$path"
+    else
+        printf '%s\t%s\n' "$label" "$path"
+    fi
+}
+
+# Resolve a path to its absolute, symlink-resolved form.
+# Always returns 0 and prints a path (best-effort).
+resolve_path() {
+    local p="$1"
+    local out=""
+
+    if command -v realpath >/dev/null 2>&1; then
+        # Prefer -m (allow missing); fall back without it
+        out=$(realpath -m -- "$p" 2>/dev/null) \
+            || out=$(realpath -- "$p" 2>/dev/null) \
+            || out=""
+    fi
+
+    if [[ -z "$out" ]]; then
+        if [[ -d "$p" ]]; then
+            out=$(cd -- "$p" 2>/dev/null && pwd -P) || out="$p"
+        elif [[ -e "$p" || -L "$p" ]]; then
+            local dir base
+            dir=$(dirname -- "$p")
+            base=$(basename -- "$p")
+            out="$(cd -- "$dir" 2>/dev/null && pwd -P)/$base" || out="$p"
+        else
+            # Last resort: readlink -f or the original string
+            out=$(readlink -f -- "$p" 2>/dev/null) || out="$p"
+        fi
+    fi
+
+    printf '%s\n' "$out"
+    return 0
+}
+
+# Return the overlay counterpart of a resolved /usr/... path.
+# /usr/bin/foo  →  /var/lib/rakuos/overlay/upper/bin/foo
+overlay_path() {
+    local resolved="$1"
+    printf '%s\n' "${OVERLAY_UPPER}/${resolved#/usr/}"
+}
+
+# Final destination must be under /usr.
+is_allowed() {
+    local r="$1"
+    case "$r" in
+        /usr|/usr/*) return 0 ;;
+        *)           return 1 ;;
+    esac
+}
+
+# Classify a single existing file/symlink (not a directory).
+# Prints: base | user
+classify_file() {
+    local path="$1"
+    local ov
+    ov=$(overlay_path "$path")
+    if [[ -e "$ov" || -L "$ov" ]]; then
+        echo "user"
+    else
+        echo "base"
+    fi
+}
+
+# ------------------------------------------------------------------
+# Main logic
+# ------------------------------------------------------------------
+
+RESOLVED=$(resolve_path "$TARGET")
+
+# Classic compatibility symlinks → force under /usr if needed
+case "$TARGET" in
+    /bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*)
+        if [[ "$RESOLVED" != /usr/* ]]; then
+            RESOLVED=$(resolve_path "/usr${TARGET}")
+        fi
+        ;;
+esac
+
+is_allowed "$RESOLVED" || die "path resolves outside /usr: $TARGET → $RESOLVED"
+
+# ------------------------------------------------------------------
+# Silent mode (-s ignores -p; still just the token)
+# ------------------------------------------------------------------
+if $silent; then
+    if [[ ! -e "$RESOLVED" && ! -L "$RESOLVED" ]]; then
+        echo "error"
+        exit 0
+    fi
+
+    # Directory (not a symlink-to-dir) → just "directory"
+    if [[ -d "$RESOLVED" && ! -L "$RESOLVED" ]]; then
+        echo "directory"
+        exit 0
+    fi
+
+    # File or symlink
+    classify_file "$RESOLVED"
+    exit 0
+fi
+
+# ------------------------------------------------------------------
+# Verbose mode
+# ------------------------------------------------------------------
+if [[ ! -e "$RESOLVED" && ! -L "$RESOLVED" ]]; then
+    die "path does not exist: $TARGET"
+fi
+
+# Single file / symlink
+if [[ ! -d "$RESOLVED" || -L "$RESOLVED" ]]; then
+    if [[ -L "$RESOLVED" && -d "$RESOLVED" ]]; then
+        kind="symlink"
+    else
+        kind=$(classify_file "$RESOLVED")
+    fi
+
+    case "$kind" in
+        base)
+            $show_base && emit "$kind" "$RESOLVED"
+            ;;
+        user)
+            $show_user && emit "$kind" "$RESOLVED"
+            ;;
+        symlink)
+            if $show_base && $show_user; then
+                emit "$kind" "$RESOLVED"
+            fi
+            ;;
+    esac
+    exit 0
+fi
+
+# Directory: list contents one level deep (no recursion)
+shopt -s nullglob dotglob
+for entry in "$RESOLVED"/*; do
+    name=$(basename -- "$entry")
+    full="$RESOLVED/$name"
+
+    if [[ -L "$full" ]]; then
+        if [[ -d "$full" ]]; then
+            label="symlink"
+        else
+            label=$(classify_file "$full")
+        fi
+    elif [[ -d "$full" ]]; then
+        label="subdirectory"
+    else
+        label=$(classify_file "$full")
+    fi
+
+    case "$label" in
+        base)
+            $show_base && emit "$label" "$full"
+            ;;
+        user)
+            $show_user && emit "$label" "$full"
+            ;;
+        subdirectory|symlink)
+            if $show_base && $show_user; then
+                emit "$label" "$full"
+            fi
+            ;;
+    esac
+done
+
+exit 0
